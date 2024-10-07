@@ -21,3 +21,4 @@
 %define	UNIT_LEN	26
 %define	HALF_UNIT	11
 %define	FLOAT_ONE	0x3F800000
+%define	NSEC	1000000000

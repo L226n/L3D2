@@ -38,10 +38,12 @@ _alloc:
 	;----------------------------------------
 	;GIVE ADDR FROM PRE_ALLOCATED SPACE
 	mov	ecx, dword[alloc_data.pointer]	;move pointer into rcx
-	mov	dword[alloc_data.addr+rcx+8], eax	;move length into current iten
+	mov	dword[alloc_data.addr+rcx+8], eax	;move length into current item
 	sub	dword[alloc_data.available], eax	;and correct available
+	mov	r8, rax	;save space requested to r8
 	mov	rax, qword[alloc_data.current]	;move current addr into rax
 	mov	qword[alloc_data.addr+rcx], rax	;and save to addr items
+	add	qword[alloc_data.current], r8	;and correct current addr pointer
 	add	dword[alloc_data.pointer], 12	;then increase pointer
 	ret	;and return
 
@@ -51,18 +53,18 @@ _barycentric:
 	mov	dword[scratchpad+36], r8d	;save point y addr here
 	mov	dword[scratchpad+32], r9d	;and x addr just before
 	movaps	xmm0, [scratchpad+32]	;now load this addr into xmm0
-	psubd	xmm0, xmm5	;subtract v0 to form V2
+	cvtdq2ps	xmm0, xmm0	;convert point to a float
+	mulps	xmm0, xmm12	;convert to range 0-2 also
+	subps	xmm0, xmm5	;subtract v0 to form V2
 	;----------------------------------------
 	;CALCULATE DOTPRODUCT D20
 	movaps	xmm1, xmm0	;duplicate V2 into xmm1
-	pmulld	xmm1, xmm3	;multiply it by V0
-	phaddd	xmm1, xmm1	;and then add horizontal vals together for dp
+	dpps	xmm1, xmm3, 0b00110001	;now get 2 element dp, like before
 	movss	dword[barycentric.w], xmm1	;first val to be multiplied by
 	movss	dword[barycentric.w+12], xmm1	;and also fourth val
 	;----------------------------------------
-	;CALCULATE D21
-	pmulld	xmm0, xmm4	;same thing but multiply by V1
-	phaddd	xmm0, xmm0	;and horizontal add again
+	;CALCULATE D21	
+	dpps	xmm0, xmm4, 0b00110001	;and then final 2 element dp
 	movss	dword[barycentric.w+4], xmm0	;now this is second val to mul
 	movss	dword[barycentric.w+8], xmm0	;and also third
 	;----------------------------------------
@@ -71,14 +73,12 @@ _barycentric:
 	movaps	xmm1, [barycentric.w]	;and w to xmm1
 	;xmm0 = {d11 d01 d00 d01}
 	;xmm1 = {d20 d21 d21 d20}
-	pmulld	xmm0, xmm1	;multiply corresponding values
+	mulps	xmm0, xmm1	;then multiply these vecs together
 	;xmm0 = {d11*d20 d01*d21 d00*d21 d01*d20}
-	phsubd	xmm0, xmm1	;and horizontal subtract
+	hsubps	xmm0, xmm0	;and get a horizontal sub
 	;xmm0 = {d11*d20-d01*d21 d00*d21 - d01*d20}
-	vbroadcastsd	ymm1, qword[barycentric.denom]	;load dp denom
-	vcvtdq2pd	ymm0, xmm0	;convert int32 in xmm0 to float64
-	vdivpd	ymm0, ymm1	;divide first two vals by denom
-	vcvtpd2ps	xmm0, ymm0	;convert the doubles to singles
+	vbroadcastss	xmm1, dword[barycentric.denom]	;load dp denom
+	mulps	xmm0, xmm1	;divide first two vals by denom
 	;----------------------------------------
 	;CALCULATE BARYCENTRIC U
 	pshufd	xmm6, xmm0, 0b00010000	;shuffle xmm6 to {v v w 0}
@@ -108,7 +108,6 @@ _create_quat:
 	movups	xmm0, [rsi]	;load vector into xmm0
 	movups	[quaternion.norm+4], xmm0	;save this to normal addr+4
 	mov	rsi, quaternion.norm+4	;save addr to rsi
-	call	_normalise_vec	;and then normalise vector in place
 	;----------------------------------------
 	;CALCULATE COS(THETA/2) AND SIN(THETA/2)
 	fld1	;load a 1
@@ -356,20 +355,23 @@ _quatmul:
 	vbroadcastss	xmm0, dword[rsi]	;load source quat real into xmm0
 	movups	xmm2, [rdx]	;move the entire operand quat into xmm2
 	mulps	xmm0, xmm2	;multiply w0 by second quat
+	movaps	xmm3, [quaternion.mulmask_npnp]	;load initial mulmask to xmm3
 	;----------------------------------------
 	;MACRO FOR NEXT ROWS
-	%macro	calc_unit	3
+	%macro	calc_unit	2
 		vbroadcastss	xmm1, dword[rsi+%1]	;load scalar imaginary part into xmm1
 		shufps	xmm2, xmm2, %2	;shuffle operand quat to match equation
 		mulps	xmm1, xmm2	;multiply together
-		xorps	xmm1, [quaternion.mulmask_%3]	;now negate certain values
+		xorps	xmm1, xmm3	;now negate certain values
 		addps	xmm0, xmm1	;and add to xmm0
 	%endmacro
 	;----------------------------------------
 	;FINISH	MULTIPLYING
-	calc_unit	4, 0b10110001, npnp	;element i, [i, w, k, j]
-	calc_unit	8, 0b00011011, nppn	;element j, [j, k, w, i]
-	calc_unit	12, 0b10110001, nnpp	;element k, [k, j, i, w]
+	calc_unit	4, 0b10110001	;element i, [i, w, k, j]
+	pshufd	xmm3, xmm3, 0b10110100	;shuffle npnp mask to become nppn
+	calc_unit	8, 0b00011011	;element j, [j, k, w, i]
+	pshufd	xmm3, xmm3, 0b01101100	;shuffle nppn mask to become nnpp
+	calc_unit	12, 0b10110001	;element k, [k, j, i, w]
 	movups	[rdi], xmm0	;save to destination
 	ret	;done!
 
@@ -400,28 +402,161 @@ _sample_texture:
 	ret	;finished!
 
 _trans_viewport:
-	xor	rax, rax
-.loop_convert:
-	cmp	dword[rdi+rax], MATRIX_DELIMITER
-	jz	.finish_convert
-	fld1
-	fadd	st0
-	fld	dword[rdi+rax]
-	fld1
-	fadd	st1
-	fdiv	st2
-	fild	word[term_size+6]
-	fmul	st1
-	fist	dword[rdi+rax]
-	fld	dword[rdi+rax+4]
-	fld1
-	fsub	st1
-	fdiv	st5
-	fild	word[term_size+4]
-	fmul	st1
-	fist	dword[rdi+rax+4]
-	emms
-	add	rax, 16
-	jmp	.loop_convert
+	cmp	dword[rdi], MATRIX_DELIMITER	;check if at end of matrix
+	jz	.finish_convert	;if yes finish
+	;----------------------------------------
+	;CONVERT NDC X COORD TO SCREEN SPACE
+	fld1	;otherwise load a 1
+	fadd	st0	;then add to itself so its 2
+	fld	dword[rdi]	;load x position in range -1 to 1
+	fld1	;load a 1
+	fadd	st1	;add it to st1 to convert to range 0 to 2
+	fdiv	st2	;divide by 2 to convert to range 0 to 1
+	fild	word[term_size.dx]	;load terminal width
+	fmul	st1	;now multiply by that by 0-1 range to get coords
+	fist	dword[rdi]	;and store back
+	;----------------------------------------
+	;CONVERT NDC Y COORD TO SCREEN SPACE
+	fld	dword[rdi+4]	;do the same with the other coord
+	fld1	;load a 1...
+	fsub	st1	;this time subtract the -1 to 1 range from 1
+	fdiv	st5	;and then div by 2 (this flips the y coords)
+	fild	word[term_size.dy]	;load y value
+	fmul	st1	;multiply again
+	fist	dword[rdi+4]	;then store
+	emms	;clear stack
+	add	rdi, 16	;go to next face
+	jmp	_trans_viewport	;and loop over
 .finish_convert:
-	ret
+	ret	;done
+
+_rotate_obj:
+	;----------------------------------------
+	;GET AND STORE SIN/COS OF θ/2
+	fld1	;load a 1
+	fadd	st0	;and turn into a 2
+	fld	dword[r8]	;now load θ
+	fdiv	st1	;divide by 2
+	fsincos	;now get sin then push cos
+	fstp	dword[quaternion]	;store cos here
+	fst	dword[quaternion+4]	;and store sin here
+	fchs	;negate the sine
+	fst	dword[quaternion+8]	;and store here also
+	emms	;clear stack
+	;----------------------------------------
+	;CREATE NORMAL+CONJUGATE QUATERNION
+	movups	xmm0, [rdx-4]	;load the axis to form [0, x, y, z]
+	movaps	xmm1, xmm0	;dupe into xmm1 too
+	vbroadcastss	xmm2, dword[quaternion+4]	;load sin θ/2
+	vbroadcastss	xmm3, dword[quaternion+8]	;load -sin θ/2
+	mulps	xmm0, xmm2	;and get ijk*sin θ/2
+	mulps	xmm1, xmm3	;then get ijk*-sin θ/2
+	insertps	xmm0, dword[quaternion], 0b00000000	;insert cos θ/2
+	insertps	xmm1, xmm0, 0b00000000	;insert it here too
+	movaps	xmm6, xmm1	;save to xmm6 bc its clobbered
+	;----------------------------------------
+	;CREATE XORMASKS FOR ADDITION
+	movaps	xmm13, [quaternion.mulmask_npnp]	;load npnp xormask
+	pshufd	xmm14, xmm13, 0b10110100	;rearrange to form nppn mask
+	pshufd	xmm15, xmm14, 0b01101100	;and then form a nnpp mask
+.loop_obj:
+	;----------------------------------------
+	;INITIALISE VALUES FOR VERTEX ROTATION
+	cmp	dword[rsi], MATRIX_DELIMITER	;check if at end of matrix
+	jz	.finish_obj	;if yes finish looping
+	pshufd	xmm2, xmm0, 0b00000000	;otherwise xmm2 is normal quat real part
+	movups	xmm3, [rsi-4]	;then xmm3 is [0 x y z] for vertex
+	insertps	xmm3, xmm3, 0b00000001	;this just clears first slot
+	mulps	xmm2, xmm3	;multiply this entirely by real part of quat
+	;----------------------------------------
+	;MACRO FOR PROCESSING MULTIPLICATION
+	%macro	fast_unit	6
+		pshufd	xmm4, xmm%5, 0b%1%1%1%1	;broadcast x value to xmm4
+		pshufd	xmm%6, xmm%6, %2	;then shuffle operand to match pattern
+		mulps	xmm4, xmm%6	;multiply these xmms together
+		xorps	xmm4, xmm%3	;then apply xormask to flip signs
+		addps	xmm%4, xmm4	;and then add to base values
+	%endmacro
+	;----------------------------------------
+	;PROCESS VALUES FOR MULTIPLICATION
+	fast_unit	01, 0b10110001, 13, 2, 0, 3	;operate second col
+	fast_unit	10, 0b00011011, 14, 2, 0, 3	;third
+	fast_unit	11, 0b10110001, 15, 2, 0, 3	;and fourth
+	;----------------------------------------
+	;MULTIPLY (Q*V) BY Q'
+	pshufd	xmm5, xmm2, 0b00000000	;as above, broadcast real to xmm5
+	mulps	xmm5, xmm1	;then multiply xmm5 by conjugate quat
+	fast_unit	01, 0b10110001, 13, 5, 2, 1	;process second col
+	fast_unit	10, 0b00011011, 14, 5, 2, 1	;third col
+	fast_unit	11, 0b10110001, 15, 5, 2, 1	;and fourth col
+	;----------------------------------------
+	;STORE ROTATED VERTEX AND FINISH LOOP
+	push	qword[rdi-8]	;push qword here to stop xmm clobbering vals
+	movups	[rdi-4], xmm5	;save the quat back
+	pop	qword[rdi-8]	;and pop this value to save previous w
+	mov	dword[rdi+12], FLOAT_ONE	;insert a 1.0 at the end to end
+	add	rsi, 16	;go to next row
+	add	rdi, 16	;in both source and dest
+	movaps	xmm1, xmm6	;and then restore conjugate quat
+	jmp	.loop_obj	;loop over
+.finish_obj:
+	mov	dword[rdi], MATRIX_DELIMITER	;at end so delimit quat
+	ret	;done
+
+_rotate_obj_copy:
+	;----------------------------------------
+	;ROTATE OBJECT AND COPY REST OF STRUCT
+	call	_rotate_obj	;rotate the object
+	%macro	finish_copy	0
+		add	rsi, 4	;add 4 onto source and dest addr
+		add	rdi, 4	;to move the addr past the matrix delimiter
+	%%loop_copy:
+		cmp	word[rsi], -1	;check if current word is -1 (face data end)
+		jz	%%finish_copy	;if yes then finish copying data
+		mov	rax, qword[rsi]	;otherwise move the face data into rax
+		mov	qword[rdi], rax	;and save it to the dest
+		add	rsi, 6	;increase these two to go to next face
+		add	rdi, 6
+		jmp	%%loop_copy	;and loop over
+	%%finish_copy:
+		ret	;finished!
+	%endmacro
+	finish_copy	;copy the rest of the data after rotating
+
+_scale_obj:
+	;----------------------------------------
+	;MACRO TO OPERATE ON ALL MATRIX VERTS
+	%macro	matmod_simple	1
+		movups	xmm1, [rdx]	;xmm1 is the vec to operate with
+	%%loop:
+		cmp	dword[rsi], MATRIX_DELIMITER	;check if at end
+		jz	%%finish	;if yes go to finish
+		movups	xmm0, [rsi]	;otherwise move current vert into xmm0
+		%1	xmm0, xmm1	;then do an operation on it
+		movups	[rdi], xmm0	;and store in destination
+		add	rsi, 16	;then increase rsi
+		add	rdi, 16	;and rdi to go to next row of matrix
+		jmp	%%loop	;loop over
+	%%finish:
+		mov	dword[rdi], MATRIX_DELIMITER	;delimit the matrix
+		ret	;and return
+	%endmacro
+	mov	dword[rdx+12], FLOAT_ONE	;make sure w multiplier is 1
+	matmod_simple	mulps	;and then multiply each vert by the vec
+
+_scale_obj_copy:
+	;----------------------------------------
+	;SCALE OBJECT AND COPY DATA
+	call	_scale_obj	;scale the object
+	finish_copy	;then finish copying over data
+
+_translate_obj:
+	;----------------------------------------
+	;TRANSLATE OBJECT
+	matmod_simple	addps	;simply add the vec to all elements
+
+_translate_obj_copy:
+	;----------------------------------------
+	;TRANSLATE OBJECT AND COPY ALL DATA
+	call	_translate_obj	;translate the object
+	finish_copy	;copy the remaining data over

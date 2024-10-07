@@ -2,6 +2,7 @@
 %include	"data.asm"	;file for data initialisations
 section	.text
 	global	_start
+	%include	"event.asm"
 	%include	"file.asm"	;file for file io
 	%include	"graphics.asm"	;file for graphics stuff
 	%include	"input.asm"
@@ -63,6 +64,17 @@ _start:
 	mov	dword[simd_screen+12], ebx	;x2
 	movzx	rbx, word[term_size.y]	;and rbx is original term height	
 	;----------------------------------------
+	;CREATE NDC TRANSFORM SIMD
+	fild	dword[term_size.x]	;load terminal x size
+	fld1	;load a 1
+	fdiv	st1	;and then get x size reciprocal to use in mul
+	fst	dword[simd_ndc]	;store in ndc simd (its not ndc eye roll)
+	fild	dword[term_size.y]	;to the same with the y coord
+	fld1	;load a 1
+	fdiv	st1	;and get reciprocal
+	fst	dword[simd_ndc+4]	;and store
+	emms	;then clear fpu stack
+	;----------------------------------------
 	;ALLOCATE AND INITIALISE FRAMEBUFFER
 	imul	rax, rbx	;multiply them together to get total term cells
 	imul	rax, UNIT_LEN	;now get data size of eventual framebuffer
@@ -79,77 +91,144 @@ _start:
 	call	_alloc	;allocate depth buffer
 	call	_clear_zbuf	;fill depth buffer with high values
 	;----------------------------------------
+	;GENERATE FRAME TIME VALUES	
+	xor	rdx, rdx	;xor rdx division thing
+	mov	rax, NSEC	;move 1 sec in nsec into rax
+	movzx	rbx, word[status.fps]	;now move fps val into rbx
+	idiv	rbx	;divide 1 sec by fps to get frame time in ns
+	dec	rax	;decrease so 1fps works
+	mov	qword[status.nsec], rax
+	fild	word[status.fps]	;load fps value now
+	fld1	;and a 1
+	fdiv	st1	;then get reciprocal of fps
+	fst	dword[status.delta]	;and store this as delta for multiplying
+	emms	;clear stack too ofc
+	;----------------------------------------
 	;INITIALISE MATRICES
 	call	_mat_view	;generate view matrix
 	call	_mat_persp	;generate perspective matrix
-	
-	mov	rax, file.buf	;temp file open test lobster game
-	call	_load_l3d
-	
-	mov	rax, file.buf2	;temp file open test lobster game
-	call	_load_ltx
 
-	mov	rax, file.buf3
-	call	_load_luv
+	mov	rax, file.buf
+	call	_load_lsc
 
-	;mov	rax, qword[alloc_data.addr+24]
-	mov	rax, matrix.cube
-	mov	qword[current.mesh], rax
-	mov	rax, qword[alloc_data.addr+36]
-	movzx	ebx, word[rax]
-	push	rbx
-	imul	rbx, 3
-	mov	qword[current.t_width], rbx
-	pop	rbx
-	dec	rbx
-	mov	dword[scratchpad], ebx
-	movzx	ebx, word[rax+2]
-	dec	rbx
-	mov	dword[scratchpad+4], ebx
-	movaps	xmm0, [scratchpad]
-	cvtdq2ps	xmm0, xmm0
-	movaps	[current.t_simd], xmm0
-	mov	qword[current.texture], rax
-	;mov	rax, qword[alloc_data.addr+48]
-	mov	rax, matrix.cubeuv
-	mov	qword[current.uv], rax
-
+.new_frame:
+	;----------------------------------------
+	;GET FRAME START TIME
+	mov	rax, 228	;sys_clock_gettime
+	mov	rdi, 4	;get info from monotonic clock
+	mov	rsi, monotonic	;and store it in this struct
+	syscall
+	;----------------------------------------
+	;PREPARE PROGRAM FOR DRAWING A NEW FRAME
+	call	_clear_fbuf	;clear screen from old chars
+	call	_clear_zbuf	;and clear z buffer
+	movzx	rcx, word[status.obj_count]	;load object count now
+	dec	rcx	;decrease it
+	imul	rcx, 6	;then multiply by 6 to get last object offset in obj data
+	mov	r8, lsc_mainloop
 .mainloop:
 	;----------------------------------------
+	;STORE ADDRESS FOR L3D OBJECT
+	push	rcx	;push this value
+	movzx	rbx, word[lsc_objects+rcx]	;then move the current obj l3d index here
+	shl	rbx, 3	;multiply by 8 to get qword offset
+	mov	rax, qword[lsc_assets.l3d+rbx]	;and then fetch the l3d address
+	mov	qword[current.mesh], rax	;store in current mesh
+	;----------------------------------------
+	;STORE ADDRESS SIMD AND WIDTH FOR TEXTURE
+	movzx	rbx, word[lsc_objects+rcx+2]	;then load the current ltx addr
+	shl	rbx, 3	;get qword offset again
+	mov	rax, qword[lsc_assets.ltx+rbx]	;fetch ltx addr
+	mov	qword[current.texture], rax	;and store as current texture
+	mov	rbx, qword[rax-24]	;now load the first qword here (textures width)
+	mov	qword[current.t_width], rbx	;and store here
+	movups	xmm0, [rax-16]	;then load the texture simd from here
+	movaps	[current.t_simd], xmm0	;and store
+	;----------------------------------------
+	;STORE ADDRESS FOR LUV DATA
+	movzx	rbx, word[lsc_objects+rcx+4]	;retrieve luv byte offset
+	shl	rbx, 3	;and change to qword offset again
+	mov	rax, qword[lsc_assets.luv+rbx]	;retrieve luv address
+	mov	qword[current.uv], rax	;and store here
+	;----------------------------------------
+	;HANDLE MAINLOOP EVENTS
+	call	_mainloop	;yeah
+	push	r8	;push mainloop offset addr
+	;----------------------------------------
 	;CONVERT OBJECT TO SCREEN SPACE
-	call	_clear_fbuf	;clear screen from old chars
-	call	_clear_zbuf
 	mov	rsi, qword[current.mesh]	;load object addr into source
 	mov	rdi, objbuf	;and destination is objbuf
 	mov	rdx, matrix.view	;multiply by view matrix
-	call	_matmul	;multiply matrices together
-	
+	call	_matmul	;multiply matrices together	
 	mov	rsi, rdi	;source == destination (in place multiplication)
 	mov	rdx, matrix.persp	;multiply by perspective matrix
 	call	_matmul	;go
 	call	_normalise_w	;now normalise by the w component
 	cmp	rax, -1	;check if rax is -1 (clip obj)
-	jz	.print_fbuf	;if yes then skip this obj
+	jz	.clip	;if yes then skip this obj
 	call	_trans_viewport	;and then translate this directly to viewport
+	;----------------------------------------
+	;DRAW MESH
 	mov	r13, qword[current.mesh]
 	call	_draw_mesh	;now finally draw the mesh
+.clip:
+	;----------------------------------------
+	;GET BACK PUSHED VALUES AND LOOP OVER
+	pop	r8	;pop	back mainloop offset addr
+	pop	rcx	;get back object counter thing
+	sub	rcx, 6	;subtract 6 to go to previous object
+	jns	.mainloop	;if result isnt signed then loop over
+.print_fbuf:
 	;----------------------------------------
 	;PRINT FRAMEBUFFER
-.print_fbuf:
 	mov	rax, 1	;sys_write
 	mov	rdi, 1	;write to stdout
 	mov	rsi, qword[FRAMEBUFFER]	;framebuffer addr start
 	mov	edx, dword[FRAMEBUFFER+8]	;and length in following dword
 	syscall
 	;----------------------------------------
-	;HANDLE AVAILABLE INPUT
-	xor	rax, rax	;sys_read
+	;POLL STDIN FOR INPUT
+	mov	rax, 7	;sys_poll ofc
+	mov	rdi, poll	;struct to poll
+	mov	rsi, 1	;only 1 fd to poll here (stdin)
+	xor	rdx, rdx	;timeout is 0 (poll instantly)
+	syscall
+	cmp	rax, 0	;check if return is 0
+	jz	.no_input	;if it is then nothing available
+	;----------------------------------------
+	;PROCESS INPUT
+	xor	rax, rax	;otherwise input is available sys_read
 	xor	rdi, rdi	;read from stdin
 	mov	rsi, scratchpad	;put data onto scratchpad for now
 	mov	rdx, 8	;good amount probably
 	syscall
 	call	_input_main	;handle the input
-	jmp	.mainloop	;render another frame now
+.no_input:
+	;----------------------------------------
+	;GET FRAME END TIME
+	mov	rax, 228	;sys_clock_gettime again
+	mov	rdi, 4	;and again clock_monotonic
+	mov	rsi, nanosleep	;and now store data in nanosleep struct
+	syscall
+	;----------------------------------------
+	;CALCULATE FRAME DELTA
+	mov	rax, qword[nanosleep.nsec]	;fuck ton of memory accesses incomming
+	sub	rax, qword[monotonic.nsec]	;calculate nsec difference between frame
+	mov	rbx, qword[nanosleep.sec]	;and also get the time in seconds
+	sub	rbx, qword[monotonic.sec]	;and calculate sec difference
+	imul	rbx, NSEC	;multiply this by nanoseconds in 1 second
+	add	rbx, rax	;and add together to get the frame delta
+	mov	rax, qword[status.nsec]	;rax is now 1/<frame> in nanoseconds
+	sub	rax, rbx	;and subtract the frame delta
+	mov	qword[nanosleep.nsec], rax	;store here
+	mov	qword[nanosleep.sec], 0	;and store a 0 in the seconds structure
+	;----------------------------------------
+	;SLEEP UNTIL NEXT FRAME IS READY
+	mov	rax, 35	;sys_nanosleep
+	mov	rdi, nanosleep	;sleep for <frame>-<frame delta>
+	xor	rsi, rsi	;return struct for when sleep is interrupted is nil
+	syscall
+	jmp	.new_frame	;render another frame after sleeping
 _int:
 	;----------------------------------------
 	;PREPARE EXIT MESSAGES
@@ -167,6 +246,7 @@ _odd:
 _seg:
 	mov	r15, stat_seg	;exit message as segfault msg
 	mov	r14, stat_seg_len	;and length is defined again here
+
 _kill:
 	;----------------------------------------
 	;DE-ALLOCATE MEMORY

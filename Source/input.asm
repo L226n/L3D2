@@ -41,7 +41,7 @@ _input_main:
 	neg	byte[status.wireframe]	;toggle wireframe mode
 	ret
 .debug_f2:
-	neg	byte[status.backfaces]
+	neg	byte[status.backfaces]	;toggle backface culling
 	ret
 .look_up:
 	;-----------------------------------------------

@@ -111,6 +111,7 @@ _draw_mesh:
 	jnz	_draw_wireframe	;if yes draw wireframe
 	add	r13, rsi	;r13 is now face start addr
 	xor	rsi, rsi	;now reset rsi for face counter
+	movaps	xmm12, [simd_ndc]	;xmm12 is the simd struct to conv to ndc
 	jmp	_draw_textures	;otherwise draw textures
 
 _draw_textures:
@@ -153,6 +154,14 @@ _draw_textures:
 	insertps	xmm0, xmm3, 0b11010000	;xmm0 = {w0 w1 0 0}
 	insertps	xmm0, xmm4, 0b11100000	;xmm0 = {w0 w1 w2 0}
 	;----------------------------------------
+	;CONVERT COORDS TO RANGE 0-2
+	cvtdq2ps	xmm5, xmm5	;convert all to floats
+	cvtdq2ps	xmm3, xmm3	;this restores saves some errors
+	cvtdq2ps	xmm4, xmm4	;from happening
+	mulps	xmm5, xmm12	;multiply these by ndc simd to convert to range 0-2
+	mulps	xmm3, xmm12	;do this with all of the coords
+	mulps	xmm4, xmm12
+	;----------------------------------------
 	;GET U/W, V/W, 1/W
 	divps	xmm10, xmm0	;divide u aspects by corresponding vertex w
 	divps	xmm11, xmm0	;divide v aspects by corresponding vertex w
@@ -160,43 +169,40 @@ _draw_textures:
 	divps	xmm9, xmm0	;and then divide to get reciprocals of w
 	;----------------------------------------
 	;COMPUTE BARYCENTRIC VECTORS INDEPENDANT OF P
-	psubd	xmm3, xmm5	;compute V0 = p1 - p0
-	psubd	xmm4, xmm5	;compute V1 = p2 - p0
+	subps	xmm3, xmm5	;compute V0 = p1 - p0
+	subps	xmm4, xmm5	;compute V1 = p2 - p0
 	;----------------------------------------
 	;BARYCENTRIC DOT PRODUCTS INDEPENDANT OF P (D00)
 	movaps	xmm0, xmm3	;save V0 to xmm0 to preserve values in xmm3
-	pmulld	xmm0, xmm0	;multiply the values all together
-	phaddd	xmm0, xmm0	;now add the y values to x
+	dpps	xmm0, xmm0, 0b00110001	;get 2 element dp
 	movss	dword[scratchpad+32], xmm0	;store d00 as first denom val to multiply
 	movss	dword[barycentric.v+8], xmm0	;and third mul val for computing v and w
 	;----------------------------------------
 	;D01
 	movaps	xmm0, xmm3	;save xmm3 to xmm0 again
-	pmulld	xmm0, xmm4	;now multiply against xmm4 (compute d01)
-	phaddd	xmm0, xmm0	;add y values to x again
+	dpps	xmm0, xmm4, 0b00110001	;two element dp again
 	movss	dword[scratchpad+36], xmm0	;and then save as second val for denom here
 	movss	dword[scratchpad+52], xmm0	;and also fourth value
 	movss	dword[barycentric.v+4], xmm0	;then second mul val here
 	movss	dword[barycentric.v+12], xmm0	;and fourth mul val
 	;----------------------------------------
 	;D11
-	movaps	xmm0, xmm4	;load xmm4 into xmm0 for d11
-	pmulld	xmm0, xmm0	;multiply by itself
-	phaddd	xmm0, xmm0	;add x and y
+	movaps	xmm0, xmm4	;load xmm4 into xmm0 for d11	
+	dpps	xmm0, xmm0, 0b00110001	;and again
 	movss	dword[scratchpad+48], xmm0	;then store as third val to mul
 	movss	dword[barycentric.v], xmm0	;and first val to mul here
 	;----------------------------------------
 	;COMPUTE BARYCENTRIC DENOMINATOR
 	movaps	xmm0, [scratchpad+32]	;load {d00 d01 0 0}
 	movaps	xmm1, [scratchpad+48]	;load {d11 d01 0 0}
-	pmulld	xmm0, xmm1	;multiply to get {d00*d11 d01*d01}
-	phsubd	xmm0, xmm0	;subtract d01*d01 from d00*d11
+	mulps	xmm0, xmm1	;multiply to get {d00*d11 d01*d01}
+	hsubps	xmm0, xmm0	;subtract d01*d01 from d00*d11
 	movss	dword[barycentric.denom], xmm0	;and store as denom
-	mov	edx, dword[barycentric.denom]	;move val into rdx (sign extend)
-	mov	qword[barycentric.denom], rdx	;then store back
-	fild	qword[barycentric.denom]	;then load onto FPU as integer
-	fst	qword[barycentric.denom]	;then save back as float
-	emms	;clear FPU stack	
+	fld	dword[barycentric.denom]	;now load the denom
+	fld1	;load a 1 also
+	fdiv	st1	;then get the reciprocal
+	fst	dword[barycentric.denom]	;and store
+	emms	;this turns a div later into a mul
 	;----------------------------------------
 	;GET TRIANGLE BOUNDING BOX
 	mov	rdx, qword[objbuf+rax]	;move point A XY into rdx
@@ -219,6 +225,7 @@ _draw_textures:
 	pmaxsd	xmm0, xmm2	;and then get max of this to clamp lower to 0
 	pcmpgtd	xmm2, xmm1	;check if 0 is greater than max vals
 	movmskps	ecx, xmm2	;move the mask into rcx
+	and	cl, ~0b00001100	;clear junk data results
 	test	ecx, 0xffffffff	;and bit test against -1
 	jnz	.next_face	;if any bits arent 0, box is offscreen
 	;----------------------------------------
@@ -227,6 +234,7 @@ _draw_textures:
 	movaps	xmm15, xmm0	;save xmm0 to xmm15
 	pcmpgtd	xmm15, xmm2	;check if lower bounds offscreen
 	movmskps	ecx, xmm15	;and move bit mask to ecx
+	and	cl, ~0b00001100	;clear junk data results again
 	test	ecx, 0xffffffff	;do the bit test again
 	jnz	.next_face	;and if any arent 0 box is offscreen
 	shufps	xmm0, xmm1, 0b01000100	;interleaved shuf for {Xmin Ymin Xmax Ymax}

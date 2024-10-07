@@ -7,7 +7,16 @@ section	.data
 	align	16
 	scratchpad:	times 100	dd	0
 	align	16
-	objbuf:	times	500*4+4	dd	0
+	objbuf:	times	100*4+4	dd	0
+	obj_transform:	times	100*4+4	dd	0
+	lsc_assets:
+		.l3d	times 100	dq	0
+		.l3d_len	times 100	dw	0
+		.l3d_index	dw	0
+		.ltx	times 100	dq	0
+		.luv	times 100	dq	0
+	lsc_objects	times 100*3	dw	0
+	lsc_mainloop	times 100	dq	0, 0
 	;-----------------------------------------------
 	;MATRICES
 	camera:
@@ -18,7 +27,7 @@ section	.data
 		.fov	dd	0.534
 		.near	dd	1.0
 		align	16
-		.pos	dd	0.0, 0.0, -1.5, 0
+		.pos	dd	0.0, 0.0, -4.5, 0
 		.speed	dd	0.2
 		.angle	dd	0.1
 		.angle_neg	dd	-0.1
@@ -43,26 +52,6 @@ section	.data
 			dd	0.0, 1.0, 0.0, 0.0
 			dd	0.0, 0.0, 1.0, 0.0
 			dd	0.0, 0.0, 0.0, 1.0, MATRIX_DELIMITER
-		.cube	dd	0.5, 0.5, 0.5, 1.0
-			dd	-0.5, 0.5, 0.5, 1.0
-			dd	0.5, -0.5, 0.5, 1.0
-			dd	-0.5, -0.5, 0.5, 1.0
-			dd	0.5, 0.5, -0.5, 1.0
-			dd	-0.5, 0.5, -0.5, 1.0
-			dd	0.5, -0.5, -0.5, 1.0
-			dd	-0.5, -0.5, -0.5, 1.0, MATRIX_DELIMITER
-			dw	5, 7, 4
-			dw	7, 6, 4
-			dw	1, 5, 0
-			dw	5, 4, 0
-			dw	-1
-			dw	65535
-		.cubeuv:
-			dd	0.0, 0.0, 0.0, 1.0, 1.0, 0.0
-			dd	0.0, 1.0, 1.0, 1.0, 1.0, 0.0
-			dd	0.0, 0.0, 0.0, 1.0, 1.0, 0.0
-			dd	0.0, 1.0, 1.0, 1.0, 1.0, 0.0
-			
 	;-----------------------------------------------
 	;MULTI-LINE STRUCTS
 	alloc_data:
@@ -74,7 +63,7 @@ section	.data
 		align	16
 		.v	dd	0, 0, 0, 0
 		.w	dd	0, 0, 0, 0
-		.denom	dq	0
+		.denom	dd	0
 	current:
 		.mesh	dq	0
 		.texture	dq	0
@@ -83,9 +72,7 @@ section	.data
 		.t_simd	dd	0, 0
 		.uv	dq	0
 	file:
-		.buf	db	"../Resources/tetrapod.l3d", 0
-		.buf2	db	"../Resources/cube.ltx", 0
-		.buf3	db	"../Resources/tetrapod.luv", 0
+		.buf	db	"../Resources/demo.lsc", 0
 		.size	dq	0
 	handler_int:
 		dq	_int
@@ -94,13 +81,33 @@ section	.data
 		dq	_seg
 		dd	0x04000000
 	line:
-		.x0:	dw	0
-		.y0:	dw	0
-		.x1:	dw	0
-		.y1:	dw	0
+		.x0	dw	0
+		.y0	dw	0
+		.x1	dw	0
+		.y1	dw	0
+	lsc_sizes:
+		.sky_col	dq	_init_sky_col, 4
+		.trans	dq	_init_trans, 15
+		.rot	dq	_init_rot, 19
+		.scale	dq	_init_scale, 15
+	.ml:
+		.ml_sky_col	dq	0, 0
+		.ml_trans	dq	0, 0
+		.ml_rot	dq	_main_rot, 23
+	nanosleep:
+		.sec	dq	0
+		.nsec	dq	0
+	monotonic:
+		.sec	dq	0
+		.nsec	dq	0
+	poll:
+		.fd	dd	0
+		.events	dw	1
+		.revents	dw	0
 	quaternion:
 		.norm	dd	0, 0, 0, 0, 0
 		.conj	dd	0, 0, 0, 0, 0
+		.temp	dd	0, 0, 0, 0, 0
 		align	16
 		.mulmask_npnp:
 			dd	0x80000000
@@ -118,9 +125,13 @@ section	.data
 			dd	0x00000000
 			dd	0x00000000
 	status:
-		.debug	db	1
-		.wireframe	db	1
 		.backfaces	db	1
+		.debug	db	1
+		.delta	dd	0
+		.fps	dw	30
+		.nsec	dq	0
+		.obj_count	dw	0
+		.wireframe	db	1
 	term_io:
 		.c_iflag	dd	0
 		.c_oflag	dd	0
@@ -141,7 +152,7 @@ section	.data
 		db	27, "[38;5;000m"
 		dd	"▄"
 	var:
-		.sky_colour	db	"000"
+		.sky_colour	db	"000", 0
 	vector:
 		align	16
 		.bitmask	dd	0xffffffff
@@ -154,6 +165,7 @@ section	.data
 	simd_zero	dd	0.0, 0.0, 0.0, 0.0
 	simd_one	dd	1.0, 1.0, 1.0, 1.0
 	simd_screen	dd	0.0, 0.0, 0.0, 0.0
+	simd_ndc	dd	0.0, 0.0, 0.0, 0.0
 	zbuf_reset	dd	0x7f7fffff, 0x7f7fffff
 	;-----------------------------------------------
 	;STRING CONSTANTS
@@ -170,4 +182,26 @@ section	.data
 	esc_erase:	db	27, "[2J"
 	esc_home:	db	27, "[H"
 	esc_reset:	db	27, "[0m"
+
+	;scene_demo:
+;		.assets_l3d	dw	1
+;		.l3d	db	"cube.l3d", 0, 1
+;		.assets_ltx	dw	1
+;		.ltx	db	"cube.ltx", 0, 1
+;		.assets_luv	dw	1
+;		.luv	db	"cube.luv", 0, 1
+;		.objcount	dw	1
+;		.objlist	dw	0, 0, 0
+;		.varcount	dw	3
+;		.varlist	db	0, "110"
+;				db	2
+;				dw	0
+;				dd	0.0, 1.0, 0.0
+;				dd	0.785
+;				db	2
+;				dw	0
+;				dd	1.0, 0.0, 0.0
+;				dd	-0.485
+;		.mlcount	dw	0
+;				dw	-1
 
